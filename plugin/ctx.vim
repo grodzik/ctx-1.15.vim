@@ -1,5 +1,5 @@
-" ctx.vim -- display current scope context of cursor in a C file          "
-" Maintainer: Chris Houser <chouser@bluweb.com>                           "
+" ctx.vim -- display current scope context of cursor in a C-like file     "
+" Maintainer: Paweł Tomak <pawel@tomak.eu>                                "
 " Copyright (C) Sept 2001 - Feb 2002, Aaron Brooks and Chris Houser       "
 " Distributed under the GNU General Public License                        "
 " $Revision: 1.17 $                                                  "
@@ -67,6 +67,12 @@ BEGIN {
     my @slines;
     my $sbuf = '';
     my $slnum = 0;
+    sub appendmsg {
+        $outbuf->Append($outbuf->Count(), $_[0]);
+    }
+    sub debugmsg {
+        $debug and appendmsg $_[0];
+    }
     sub badd {
         $sbuf = ($_[0] || '') . $sbuf;
     }
@@ -86,12 +92,6 @@ BEGIN {
         @slines  and $slines[0][0] = $_[0] . ' ' . $slines[0][0];
         !@slines and bdo $_[0];
         bclear;
-    }
-    sub appendmsg {
-        $outbuf->Append($outbuf->Count(), $_[0]);
-    }
-    sub debugmsg {
-        $debug and appendmsg $_[0];
     }
     sub bout {
         my $depth = -1;
@@ -220,7 +220,7 @@ BEGIN {
     CTX::importsubs qw( badd bclear bln bdo bdopre bout debugmsg appendmsg );
     CTX::buildstates qw(
         PRECTRL BRACE PREBRACE ELSE PAREN CTRL FUNC
-        WANTIF EPAREN EBRACE PREELSE );
+        WANTIF EPAREN EBRACE PREELSE CPAREN CONTAINER CBRACE );
 }
 
 sub run {
@@ -236,6 +236,7 @@ sub run {
     my $gotlabel= 0; # we've seen a label at this brace depth
     my $comment = 0; # 1 == the start of previous line was in a block comment
     my $lvl     = 0; # level of brace depth, counting up from cursor location
+    my $contained = 0;
 
     # main parsing loop
     $_ = '';
@@ -243,7 +244,7 @@ sub run {
     goPRECTRL;
     while ($CTX::lnum > 0) {
         $_ = $main::curbuf->Get(--$CTX::lnum) or next unless $_;
-        debugmsg sprintf("%-12s%s",$snames[$state].'['.$gotbrace.']:',$_);
+        debugmsg sprintf("%-12s%s",$snames[$state].'[gb:'.$gotbrace.'][l:'.$lvl.'][b:'.$braced.']:',$_);
 
         # safety
         if ($oldl == $CTX::lnum && $old_ eq $_ && $olds == $state) {
@@ -262,12 +263,12 @@ sub run {
         }
 
         # comments and strings
-        s{^[#]         .*$}{}x;  # for now, clobber #directives
-        s{    " .*? " \s* }{}gx;
-        s{   /\*.*?\*/\s* }{}gx;
-        s{   //        .*$}{}x;
-        s{^.*      \*/\s*$}{}x   and do { $comment = 1; next };
-        s{   /\*       .*$}{}x   and do { $comment = 0       };
+        s{^[#]                .*$}{}x;  # for now, clobber #directives
+        s{"([^\\"]|\\\\|\\")*"\s*}{}gx;
+        s{   /\*.*?\*/\s*        }{}gx;
+        s{   //               .*$}{}x;
+        s{^.*             \*/\s*$}{}x   and do { $comment = 1; next };
+        s{   /\*              .*$}{}x   and do { $comment = 0       };
         $comment                 and do { $_ = '';      next };
 
         # state machine
@@ -286,18 +287,22 @@ sub run {
             $gotlabel = 0;
             s/\bdo\s*$// and do {bdo $& . CTXFWD::dowhile($lvl);goPRECTRL;next};
             s/\belse      \s*$//x and do { bdo $&; goELSE; next };
-            s/[;:{}][^;:{})]*$//x and do { bdo '{'; $_.=$&; goBRACE; next };
-            s/[)]  [^)]*     $//x and do { badd $&; $parend=1; goPAREN; next };
+            $braced<1 || !$conained and s/\s*(class\s+[^\s:{()}]+).*//x and do { $_.=$&; goCONTAINER; next };
+            s/[;:{}][^;:{})]*$//x and do { !$contained and bdo '{'; $_.=$&; $braced=0; !$contained and goBRACE; $contained and goCBRACE; next };
+            s/[)]  [^)]*     $//x and do { badd $&; $parend=1; !$contained and goPAREN; $contained and goCPAREN; next };
         };
 
         BRACE ||
+        CBRACE ||
         EBRACE and do {
             BRACE  && $braced==0 and do { $braced=1;++$lvl;bln;goPREBRACE;next};
             EBRACE && $braced==0 and do { $braced=1; goPREELSE;  next };
+            CBRACE && $braced<0 and do { ++$lvl; bclear; bln; goPREBRACE; next };
             !$gotlabel && $braced==1 && s/^\s*((case\s+)?\w+\s*:)[^:{}]*$//x and
                 do { bdo $1; $gotlabel=1; next};
             s/}[^{}:]*$//x        and do { ++$braced; next };
             s/{[^{}:]*$//x        and do { --$braced; next };
+            !CBRACE and s/\s*(class\s+[^\s:{()}]+).*//x and do { $_.=$&; ++$lvl; goCONTAINER; next };
         };
 
         ELSE and do {
@@ -306,24 +311,35 @@ sub run {
         };
 
         PAREN ||
+        CPAREN ||
         EPAREN and do {
             PAREN  && $parend < 1  and do { goCTRL;   next};
             EPAREN && $parend < 1  and do { goWANTIF; next};
+            CPAREN && $parend < 1  and do { goCONTAINER; next };
             s/[)][^()]*$//x        and do { badd $&; ++$parend; next };
             s/[(][^()]*$//x        and do { badd $&; --$parend; next };
             badd $_.' ';
         };
 
         CTRL and do {
-            s/\b(if|switch|while|for)\s*$// and do { bln;bdo $&;goPRECTRL;next};
+            s/\b(if|switch|while|for|foreach|catch)\s*$// and do { bln;bdo $&;goPRECTRL;next};
             !$gotbrace && s/[^;\s]\s*$//    and do { bclear; goPRECTRL;   next};
             $gotbrace  && s/[^;\s]\s*$//    and do { bln; $_.=$&; goFUNC; next};
             badd $_.' ';
         };
 
+        CONTAINER and do {
+            $contained=1;
+            s/[)][^)]*//x and do { badd $&; $parend=1; goCPAREN; next };
+            s/:[^:]*$//x and do { badd $&; next };
+            s/class\s+\S+//x and do { bdo $&; $braced=0; goCBRACE; next };
+        };
+
         FUNC and do {
-            s/[^;}]+$//x and do { badd $&.' '; next };
-            s/[;}]  $//x and do { bdo ' '; last };
+            s/[^;{}]+$//x and do { badd $&.' '; next };
+            s/[{]  $//x and do { bdo ''; $braced=-1; $contained=1; goCBRACE; next };
+            s/[}]  $//x and do { bdo ''; $braced=1; $contained=1; goCBRACE; next };
+            s/[;]  $//x and do { bdo ''; $braced=0; $contained=1; goPREBRACE; next };
             badd $_.' ';
         };
 
@@ -407,10 +423,11 @@ endfunction
 
 " main function "
 function! s:update()
+    let ft = &filetype
     if bufloaded('--context--') == 0
         let start = bufname('%')
         topleft new --context--
-        set filetype=c nowrap buftype=nofile bufhidden=delete noswapfile
+        execute "set filetype=" . ft . " nowrap buftype=nofile bufhidden=delete noswapfile"
         call s:gotobuf(start)
     endif
 
@@ -427,6 +444,8 @@ endfunction
 augroup CTX
     au!
     au CursorHold  *.[cC] call <SID>cursorhold()
+    au CursorHold  *.[cC][pP][pP] call <SID>cursorhold()
+    au CursorHold  *.pike call <SID>cursorhold()
     au BufEnter    *      call <SID>autohide()
 augroup END
 
